@@ -17,7 +17,8 @@ import sys, os
 from PyQt5.QtGui import QIcon
 
 APP_TITLE = "PDF 图片工具箱"
-
+APP_VERSION = "v1.1"
+GITHUB_URL = "https://github.com/xjhaz/pdf-image-toolbox"
 # ========= 单位换算 =========
 INCH_TO_PT = 72.0
 CM_TO_PT = INCH_TO_PT / 2.54  # ≈28.3464567
@@ -683,6 +684,42 @@ class TabExtract(QWidget):
             except Exception: pass
             self.btn_go.setEnabled(True)
 
+class TabAbout(QWidget):
+    def __init__(self):
+        super().__init__()
+        g = QGridLayout(self); r = 0
+
+        title = QLabel(
+            f"<h2 style='margin:0;'>PDF Image Toolbox "
+            f"<span style='font-size:12px; color:#666; border:1px solid #ddd; "
+            f"padding:2px 8px; border-radius:10px; vertical-align:middle;'>{APP_VERSION}</span>"
+            f"</h2>"
+        )
+        g.addWidget(title, r, 0, 1, 2); r += 1
+
+        desc = QLabel("基于 <b>PyQt5</b> 与 <b>PyMuPDF (fitz)</b> 的 PDF 图像提取 / 批量插入工具。")
+        desc.setWordWrap(True)
+        g.addWidget(desc, r, 0, 1, 2); r += 1
+
+        link = QLabel(f"GitHub：<a href='{GITHUB_URL}'>{GITHUB_URL}</a>")
+        link.setOpenExternalLinks(True)
+        g.addWidget(link, r, 0, 1, 2); r += 1
+
+        btn_open = QPushButton("打开 GitHub")
+        btn_copy = QPushButton("复制仓库地址")
+        btn_open.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(GITHUB_URL)))
+        btn_copy.clicked.connect(lambda: self._copy(GITHUB_URL))
+        g.addWidget(btn_open, r, 0)
+        g.addWidget(btn_copy, r, 1); r += 1
+
+        note = QLabel("© 2025 xjhaz")
+        note.setStyleSheet("color:#888;")
+        g.addWidget(note, r, 0, 1, 2)
+
+    def _copy(self, text: str):
+        QApplication.clipboard().setText(text)
+        QMessageBox.information(self, "已复制", "仓库地址已复制到剪贴板。")
+
 # ========= 主窗口 =========
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -692,9 +729,12 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         self.tab_insert = TabInsert()
         self.tab_extract = TabExtract()
+        self.tab_about  = TabAbout() 
         tabs.addTab(self.tab_extract, "从PDF提取配置")
         tabs.addTab(self.tab_insert, "批量插入")
+        tabs.addTab(self.tab_about,  "关于")  
         self.setCentralWidget(tabs)
+        
 
 def main():
     app = QApplication(sys.argv)
