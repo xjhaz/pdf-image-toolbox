@@ -17,7 +17,7 @@ import sys, os
 from PyQt5.QtGui import QIcon
 
 APP_TITLE = "PDF 图片工具箱"
-APP_VERSION = "v1.1"
+APP_VERSION = "v1.2"
 GITHUB_URL = "https://github.com/xjhaz/pdf-image-toolbox"
 # ========= 单位换算 =========
 INCH_TO_PT = 72.0
@@ -720,6 +720,142 @@ class TabAbout(QWidget):
         QApplication.clipboard().setText(text)
         QMessageBox.information(self, "已复制", "仓库地址已复制到剪贴板。")
 
+class TabUsage(QWidget):
+    def __init__(self):
+        super().__init__()
+        g = QGridLayout(self)
+
+        view = QTextEdit()
+        view.setReadOnly(True)
+        view.setMinimumHeight(420)
+        view.setHtml(self._build_html())
+        g.addWidget(view, 0, 0, 1, 2)
+
+    def _build_html(self) -> str:
+        html = f"""
+        <html>
+        <head>
+        <meta charset="utf-8" />
+        <style>
+          body {{ font-family: -apple-system, Segoe UI, Microsoft YaHei, Arial, sans-serif; color:#222; }}
+          h2 {{ margin: 0 0 10px 0; }}
+          h3 {{ margin: 16px 0 8px 0; }}
+          p  {{ margin: 6px 0 10px 0; color:#444; line-height:1.6; }}
+          ul {{ margin: 6px 0 12px 22px; }}
+          li {{ margin: 4px 0; }}
+          table {{ border-collapse: collapse; width: 100%; margin: 8px 0 14px 0; }}
+          th, td {{ border: 1px solid #e5e5e5; padding: 8px 10px; vertical-align: top; }}
+          th {{ background: #fafafa; font-weight: 600; text-align: left; }}
+          code {{ background:#f6f6f6; padding:1px 4px; border-radius:4px; }}
+          .note {{ color:#777; font-size:13px; }}
+          .ok {{ color:#129900; }}
+          .warn {{ color:#c25; }}
+        </style>
+        </head>
+        <body>
+          <h2>使用说明 / 功能概述</h2>
+          <p class="note">版本 {APP_VERSION} · GitHub：<a href="{GITHUB_URL}">{GITHUB_URL}</a></p>
+
+          <table>
+            <tr>
+              <th>功能</th>
+              <th>说明</th>
+            </tr>
+            <tr>
+              <td>📤 <b>从 PDF 提取图片</b></td>
+              <td>扫描 PDF 内嵌图像（XObject），导出为 PNG，并生成 <code>&lt;PDF文件名&gt;_config.json</code> 以记录坐标/尺寸/页码等。</td>
+            </tr>
+            <tr>
+              <td>📥 <b>批量插入图片</b></td>
+              <td>按配置或手填参数将图片批量插入多个 PDF，支持缩放、保持等比、页码选择与目录遍历。</td>
+            </tr>
+            <tr>
+              <td>🧩 <b>智能配置</b></td>
+              <td>提取阶段自动保存配置；插入阶段可导入/导出，便于复用与团队协作。</td>
+            </tr>
+            <tr>
+              <td>📂 <b>批量处理目录</b></td>
+              <td>遍历根目录下所有 PDF，逐个应用规则；避免处理输出目录以防递归。</td>
+            </tr>
+            <tr>
+              <td>🎨 <b>界面与交互</b></td>
+              <td>所有路径均可视化编辑；表格支持双击预览、右键替换图片。</td>
+            </tr>
+          </table>
+
+          <h3>① 页签「从PDF提取→配置」</h3>
+          <ul>
+            <li><b>PDF 文件 / 浏览…</b>：选择要扫描的 PDF。</li>
+            <li><b>导出根目录 / 浏览…</b>：默认自动填为 <code>&lt;PDF同目录&gt;/pic</code>（已统一为正斜杠路径）。</li>
+            <li><b>单位</b>：坐标/尺寸显示与导出的单位（<code>cm</code> / <code>pt</code> / <code>inch</code>）。</li>
+            <li><b>Y坐标基准</b>：
+              <ul>
+                <li>「从下往上（PDF 标准）」：PDF 原生坐标，原点在左下。</li>
+                <li>「从上往下（屏幕/GUI）」：更贴近屏幕系，原点在左上。</li>
+              </ul>
+            </li>
+            <li><b>页码（如 1,3-5）</b>：可指定扫描页，留空表示扫描所有页。</li>
+            <li><b>导出时白底（去透明）</b>：导出的 PNG 去除 alpha 通道并加白底，便于某些图像编辑器或下游流程。</li>
+            <li><b>扫描并导出</b>：执行提取，输出：
+              <ul>
+                <li>图片：<code>pic/&lt;PDF名&gt;_0001.png</code>、<code>_0002.png</code> …</li>
+                <li>配置：<code>pic/&lt;PDF名&gt;_config.json</code>（记录每张图的 <code>x,y,width,height,scale_x,scale_y,page,unit</code> 等）。</li>
+              </ul>
+            </li>
+          </ul>
+
+          <h3>② 页签「批量插入」</h3>
+          <ul>
+            <li><b>处理目录 / 浏览…</b>：选择包含待处理 PDF 的根目录；选择后，<b>输出目录</b>默认自动填为 <code>&lt;处理目录&gt;/output</code>（可改）。</li>
+            <li><b>输出目录 / 浏览…</b>：保存处理结果的根目录；程序自动按相对路径创建子目录。</li>
+            <li><b>文件名添加后缀 _signed</b>：若勾选，输出 PDF 会在文件名后附加 <code>_signed</code>。</li>
+            <li><b>单位</b>：与提取一致，用于解释/换算你的坐标与尺寸输入。</li>
+            <li><b>Y坐标基准</b>：与提取一致，<span class="ok">建议提取与插入阶段保持一致</span>。</li>
+            <li><b>导出配置… / 导入配置…</b>：保存/载入当前表格的插入规则 JSON。</li>
+            <li><b>规则表格（列）</b>：
+              <ul>
+                <li><code>图片路径</code>（只读列，双击可在系统查看器中预览；右键可替换图片）。</li>
+                <li><code>X(单位), Y(单位)</code>：插入位置的左上角/左下角（取决于 Y 基准）。</li>
+                <li><code>宽W, 高H</code>：目标尺寸（与单位一致）。</li>
+                <li><code>X缩放%, Y缩放%</code>：在给定 <code>宽W/高H</code> 的基础上再缩放；勾选「保持等比」时使用两者的较小值。</li>
+                <li><code>页(数字或last)</code>：目标页号，或填 <code>last</code> 表示最后一页。</li>
+                <li><code>保持等比</code>：对目标宽高按统一比例缩放。</li>
+              </ul>
+            </li>
+            <li><b>添加图片… / 删除所选</b>：向表格添加/删除规则行。</li>
+            <li><b>开始处理</b>：遍历 <b>处理目录</b> 下所有 PDF，按表格规则逐个插入并保存到 <b>输出目录</b>。</li>
+          </ul>
+
+          <h3>③ 典型工作流</h3>
+          <ol>
+            <li><b>提取</b>：在「从PDF提取→配置」选择 PDF → 点击「扫描并导出」。得到 <code>pic/*.png</code> 与 <code>_config.json</code>。</li>
+            <li><b>校对</b>：如需微调，编辑 <code>_config.json</code>（或在「批量插入」载入后修改表格）。</li>
+            <li><b>插入</b>：切换到「批量插入」，选择 <b>处理目录</b> 与 <b>输出目录</b> → 导入配置 → 开始处理。</li>
+          </ol>
+
+          <h3>④ 默认行为与细节</h3>
+          <ul>
+            <li><b>路径风格</b>：程序统一在界面中显示正斜杠（如 <code>E:/path/to/pic</code>）。</li>
+            <li><b>命名</b>：提取的图片按页内出现顺序自动编号；配置名固定为 <code>&lt;PDF名&gt;_config.json</code>。</li>
+            <li><b>颜色/透明</b>：对 CMYK 做 RGB 转换；若存在软遮罩（<code>/SMask</code>）或 <code>/Decode [1 0]</code> 反相的情况，会自动合成/纠正；可选白底输出。</li>
+            <li><b>加密 PDF</b>：若无法空密码解密，将跳过该文件。</li>
+            <li><b>避免递归</b>：插入模式遍历时会自动跳过输出目录。</li>
+          </ul>
+
+          <h3>⑤ 常见问题</h3>
+          <ul>
+            <li><span class="warn">图像位置上下颠倒？</span> → 检查「Y坐标基准」是否与提取阶段一致。</li>
+            <li><span class="warn">插入后尺寸不合适？</span> → 确认单位（cm/pt/inch）以及是否勾选了「保持等比」。</li>
+            <li><span class="warn">图标/资源找不到？</span> → 打包时使用 <code>--add-data</code>，并在代码中用 <code>resource_path()</code> 寻址。</li>
+          </ul>
+
+          <p class="note">更多问题与更新请访问：<a href="{GITHUB_URL}">{GITHUB_URL}</a></p>
+        </body>
+        </html>
+        """
+        return html
+
+
 # ========= 主窗口 =========
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -729,9 +865,11 @@ class MainWindow(QMainWindow):
         tabs = QTabWidget()
         self.tab_insert = TabInsert()
         self.tab_extract = TabExtract()
+        self.tab_usage  = TabUsage()
         self.tab_about  = TabAbout() 
         tabs.addTab(self.tab_extract, "从PDF提取配置")
         tabs.addTab(self.tab_insert, "批量插入")
+        tabs.addTab(self.tab_usage,  "使用说明")
         tabs.addTab(self.tab_about,  "关于")  
         self.setCentralWidget(tabs)
         
