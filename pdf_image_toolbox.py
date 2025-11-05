@@ -5,20 +5,18 @@ from typing import List, Dict, Any, Tuple, Optional
 import fitz  # PyMuPDF
 from PyQt5.QtGui import QIcon
 
-from PyQt5.QtCore import Qt, QPoint, QUrl
+from PyQt5.QtCore import Qt, QPoint, QUrl, QObject, pyqtSignal, QThread
 from PyQt5.QtGui import QDesktopServices
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QGridLayout, QLabel, QLineEdit, QPushButton,
     QFileDialog, QTableWidget, QTableWidgetItem, QHeaderView, QCheckBox, QTextEdit,
-    QMessageBox, QComboBox, QTabWidget, QMenu, QStyledItemDelegate
+    QMessageBox, QComboBox, QTabWidget, QMenu, QStyledItemDelegate, QProgressBar
 )
 
-import sys, os
-from PyQt5.QtGui import QIcon
-
 APP_TITLE = "PDF 图片工具箱"
-APP_VERSION = "v1.2"
+APP_VERSION = "v1.2.2" 
 GITHUB_URL = "https://github.com/xjhaz/pdf-image-toolbox"
+
 # ========= 单位换算 =========
 INCH_TO_PT = 72.0
 CM_TO_PT = INCH_TO_PT / 2.54  # ≈28.3464567
@@ -105,10 +103,8 @@ def pdf_has_decode_invert(doc: fitz.Document, xref: int) -> bool:
         obj = doc.xref_object(xref, compressed=False)
         if obj is None: return False
         s = obj.replace(" ", "").replace("\n", "")
-        # /Decode[1 0] 或 /Decode[1.0 0.0] 等都认为反相
         if "/Decode[10]" in s:  # 最常见
             return True
-        # 宽松匹配，避免小数/多个空格
         if "/Decode[" in s:
             try:
                 seg = s.split("/Decode[",1)[1].split("]",1)[0]
@@ -128,7 +124,6 @@ def build_pixmap_from_xref(doc: fitz.Document, xref: int) -> fitz.Pixmap:
     - 若存在 Soft Mask（/SMask），合成为 alpha，并根据 smask 的 /Decode 反相判断
     - 若主图像自身 /Decode [1 0]，对主图像反相
     """
-    # 主图像
     pix = fitz.Pixmap(doc, xref)
 
     # CMYK → RGB
@@ -141,7 +136,6 @@ def build_pixmap_from_xref(doc: fitz.Document, xref: int) -> fitz.Pixmap:
     # 主图像 /Decode [1 0] → 反相
     try:
         if pdf_has_decode_invert(doc, xref):
-            # 仅对颜色反相；alpha（若已有）不变
             pix.invertIRect(fitz.Rect(0, 0, pix.width, pix.height))
     except Exception:
         pass
@@ -158,15 +152,12 @@ def build_pixmap_from_xref(doc: fitz.Document, xref: int) -> fitz.Pixmap:
     if sm_xref:
         try:
             sm = fitz.Pixmap(doc, sm_xref)
-            # 尺寸需一致
             if sm.width != pix.width or sm.height != pix.height:
-                sm = None  # 尺寸不一致则弃用
+                sm = None
             else:
                 alpha = sm.samples  # bytes
-                # 若 smask 自身有 /Decode [1 0]，alpha 需要反相
                 if pdf_has_decode_invert(doc, sm_xref):
                     alpha = bytes(255 - b for b in alpha)
-                # 合成 alpha
                 pixw = fitz.Pixmap(pix)  # 可写副本
                 pixw.set_alpha(alpha)
                 pix = pixw
@@ -198,13 +189,147 @@ class PathColumnNoEditDelegate(QStyledItemDelegate):
             return None
         return super().createEditor(parent, option, index)
 
-# ========= 页签B：批量插入 =========
+# ========= 批量插入：后台线程（新增） =========
+class InsertWorker(QObject):
+    log = pyqtSignal(str)
+    progress_max = pyqtSignal(int)
+    progress_val = pyqtSignal(int)
+    started = pyqtSignal()
+    finished = pyqtSignal(int, int, str)  # ok, fail, out_root_abs
+
+    def __init__(self, root: str, out_root_abs: str, add_suffix: bool,
+                 rules: List[Dict[str, Any]], unit: str, origin_mode: str):
+        super().__init__()
+        self.root = root
+        self.out_root_abs = out_root_abs
+        self.add_suffix = add_suffix
+        self.rules = rules
+        self.unit = unit
+        self.origin_mode = origin_mode
+
+    def _emit(self, s: str):
+        self.log.emit(s)
+
+    def run(self):
+        self.started.emit()
+        use_pdf_origin = self.origin_mode.startswith("从下往上")
+
+        # 预扫描 PDF 列表，并排除输出目录
+        pdf_list: List[str] = []
+        for dirpath, dirs, files in os.walk(self.root):
+            abs_dirs = [os.path.abspath(os.path.join(dirpath, d)) for d in dirs]
+            dirs[:] = [d for d, absd in zip(dirs, abs_dirs)
+                       if not (absd == self.out_root_abs or absd.startswith(self.out_root_abs + os.sep))]
+            for f in files:
+                if f.lower().endswith(".pdf"):
+                    pdf_list.append(os.path.join(dirpath, f))
+
+        total_steps = max(1, len(pdf_list) * max(1, len(self.rules)))
+        self.progress_max.emit(total_steps)
+        step = 0
+        ok = 0
+        fail = 0
+
+        self._emit(f"=== 开始处理（单位：{self.unit}；Y基准：{self.origin_mode}） ===")
+        self._emit(f"处理目录：{to_posix_abs(self.root)}")
+        self._emit(f"输出目录：{to_posix_abs(self.out_root_abs)}")
+
+        for pdf in pdf_list:
+            try:
+                doc = fitz.open(pdf)
+            except Exception as e:
+                fail += 1
+                self._emit(f"⚠️ 无法打开：{pdf} -> {e}")
+                step += max(1, len(self.rules))
+                self.progress_val.emit(step)
+                continue
+
+            # 解密尝试
+            if doc.is_encrypted:
+                try:
+                    if not doc.authenticate(""):
+                        fail += 1
+                        self._emit(f"⚠️ 加密且无法解密，跳过：{pdf}")
+                        doc.close()
+                        step += max(1, len(self.rules))
+                        self.progress_val.emit(step)
+                        continue
+                except Exception:
+                    fail += 1
+                    self._emit(f"⚠️ 加密文件，跳过：{pdf}")
+                    doc.close()
+                    step += max(1, len(self.rules))
+                    self.progress_val.emit(step)
+                    continue
+
+            try:
+                for rule in self.rules:
+                    # —— 按规则插入 —— 
+                    X = as_float(rule["x"]); Y = as_float(rule["y"])
+                    W = as_float(rule["width"]); H = as_float(rule["height"])
+                    Sx = as_float(rule["scale_x"], 100.0); Sy = as_float(rule["scale_y"], 100.0)
+                    keep_aspect = bool(rule.get("keep_aspect", True))
+                    if keep_aspect:
+                        s = min(Sx, Sy) / 100.0; Wf, Hf = W * s, H * s
+                    else:
+                        Wf, Hf = W * (Sx/100.0), H * (Sy/100.0)
+
+                    x_pt = to_pt(X, self.unit); w_pt = to_pt(Wf, self.unit)
+                    y_input_pt = to_pt(Y, self.unit); h_pt = to_pt(Hf, self.unit)
+
+                    pno = page_index(doc, rule["page"]); page = doc[pno]
+                    page_h = page.rect.height
+                    if use_pdf_origin:
+                        x0 = x_pt; y0 = page_h - (y_input_pt + h_pt)
+                    else:
+                        x0 = x_pt; y0 = y_input_pt
+
+                    rect = fitz.Rect(x0, y0, x0 + w_pt, y0 + h_pt)
+                    page.insert_image(rect, filename=rule["image"], keep_proportion=False)
+
+                    step += 1
+                    self.progress_val.emit(step)
+                    # self._emit(f"· 已在 “{os.path.basename(pdf)}” 第{pno+1}页插入 1 张图")
+
+            except Exception as e:
+                fail += 1
+                self._emit(f"⚠️ 插入失败：{pdf} -> {e}")
+                try: doc.close()
+                except: pass
+                continue
+
+            # 保存输出
+            rel = os.path.relpath(pdf, self.root)
+            out_dir = os.path.join(self.out_root_abs, os.path.dirname(rel)); ensure_dir(out_dir)
+            base = os.path.basename(rel)
+            name, ext = (base[:-4], base[-4:]) if base.lower().endswith(".pdf") else (base, ".pdf")
+            if self.add_suffix: name += "_signed"
+            out_pdf = os.path.join(out_dir, name + ext)
+
+            try:
+                doc.save(out_pdf); ok += 1
+                self._emit(f"✅ 已处理：{to_posix_abs(out_pdf)}")
+            except Exception as e:
+                fail += 1
+                self._emit(f"⚠️ 保存失败：{to_posix_abs(out_pdf)} -> {e}")
+            finally:
+                try: doc.close()
+                except: pass
+
+        self._emit(f"=== 完成：成功 {ok}，失败 {fail} ===")
+        self.finished.emit(ok, fail, self.out_root_abs)
+
+# ========= 页签B：批量插入（保持 v1.2.1 输出目录逻辑，新增进度条/打开目录） =========
 class TabInsert(QWidget):
     COLS = ["图片路径","X(单位)","Y(单位)","宽W(单位)","高H(单位)","X缩放%","Y缩放%","页(数字或last)","保持等比"]
 
     def __init__(self):
         super().__init__()
         g = QGridLayout(self); r = 0
+
+        # 保持：用户手动修改输出目录的标记
+        self.out_modified_by_user = False
+        self.last_out_dir = ""  # 处理完成后用于“打开输出目录”
 
         g.addWidget(QLabel("处理目录："), r, 0)
         self.le_root = QLineEdit()
@@ -213,6 +338,7 @@ class TabInsert(QWidget):
 
         g.addWidget(QLabel("输出目录："), r, 0)
         self.le_out = QLineEdit()
+        self.le_out.textEdited.connect(self._on_out_edited)  # 用户手改 -> 标记
         b_out = QPushButton("浏览…"); b_out.clicked.connect(self.choose_out)
         g.addWidget(self.le_out, r, 1, 1, 7); g.addWidget(b_out, r, 8); r += 1
 
@@ -247,25 +373,45 @@ class TabInsert(QWidget):
 
         self.log = QTextEdit(); self.log.setReadOnly(True)
         g.addWidget(self.log, r, 0, 1, 9); r += 1
+
+        # 新增：进度条
+        self.pb = QProgressBar(); self.pb.setRange(0, 1); self.pb.setValue(0)
+        g.addWidget(self.pb, r, 0, 1, 9); r += 1
+
+        # 控制按钮区（新增“打开输出目录”）
         self.btn_go = QPushButton("开始处理"); self.btn_go.clicked.connect(self.run)
+        self.btn_open_out = QPushButton("打开输出目录"); self.btn_open_out.setEnabled(False)
+        self.btn_open_out.clicked.connect(self.open_out_dir)
         g.addWidget(self.btn_go, r, 0, 1, 2)
+        g.addWidget(self.btn_open_out, r, 2, 1, 2); r += 1
 
         self.tab.cellDoubleClicked.connect(self.on_cell_double_clicked)
         self.tab.setContextMenuPolicy(Qt.CustomContextMenu)
         self.tab.customContextMenuRequested.connect(self.on_table_context_menu)
 
+        # 线程对象占位
+        self._thread: Optional[QThread] = None
+        self._worker: Optional[InsertWorker] = None
+
+    def _on_out_edited(self, _text: str):
+        self.out_modified_by_user = True
+
     def choose_root(self):
         d = QFileDialog.getExistingDirectory(self, "选择处理的根目录", os.getcwd())
         if d:
             self.le_root.setText(d)
-            # 改动3：自动填充默认输出目录（可再次修改）
-            default_out = os.path.join(d, "output")
-            default_out = to_posix_abs(default_out)
-            self.le_out.setText(default_out)
+            # 仅当用户尚未自定义或当前为空时，才自动填入默认输出目录（保持 v1.2.1 逻辑）
+            if (not self.out_modified_by_user) or (not self.le_out.text().strip()):
+                default_out = os.path.join(d, "output")
+                self.le_out.setText(to_posix_abs(default_out))
+                self.out_modified_by_user = False  # 自动填充不算用户修改
 
     def choose_out(self):
         d = QFileDialog.getExistingDirectory(self, "选择输出目录（可不选）", os.getcwd())
-        if d: self.le_out.setText(d)
+        if d:
+            self.le_out.setText(to_posix_abs(d))
+            self.out_modified_by_user = True
+
     def logln(self, s: str): self.log.append(s); self.log.ensureCursorVisible()
 
     def add_rows(self):
@@ -347,7 +493,7 @@ class TabInsert(QWidget):
         for r in rules:
             r2 = dict(r); r2["image"] = to_posix_abs(r.get("image","")); norm_rules.append(r2)
         cfg = dict(
-            version="1.2",
+            version=APP_VERSION,
             unit=self.cb_unit.currentText().strip() or "cm",
             add_suffix=self.cb_suffix.isChecked(),
             output_dir=self.le_out.text().strip(),
@@ -377,7 +523,12 @@ class TabInsert(QWidget):
         yorg = cfg.get("y_origin","从下往上（PDF 标准）")
         if yorg not in ("从下往上（PDF 标准）","从上往下（屏幕/GUI）"): yorg = "从下往上（PDF 标准）"
         self.cb_origin.setCurrentText(yorg)
-        outd = cfg.get("output_dir","");  self.le_out.setText(outd or "")
+
+        # 仅当配置中提供非空 output_dir 时才覆盖当前值（保持 v1.2.1 行为）
+        outd = (cfg.get("output_dir","") or "").strip()
+        if outd:
+            self.le_out.setText(outd)
+            self.out_modified_by_user = True  # 视为显式指定
 
         self.tab.setRowCount(0)
         for rule in cfg.get("rules", []):
@@ -401,12 +552,12 @@ class TabInsert(QWidget):
     def run(self):
         unit = self.cb_unit.currentText().strip() or "cm"
         origin_mode = self.cb_origin.currentText()
-        use_pdf_origin = origin_mode.startswith("从下往上")
 
         root = self.le_root.text().strip()
         if not root: QMessageBox.warning(self, "提示", "请先选择处理的根目录。"); return
         if not os.path.isdir(root): QMessageBox.warning(self, "提示", "处理目录不存在。"); return
 
+        # 优先使用当前“输出目录”；为空时回退为 <root>/output（保持 v1.2.1）
         out_root = self.le_out.text().strip() or os.path.join(root, "output")
         out_root_abs = os.path.abspath(out_root); ensure_dir(out_root_abs)
         add_suffix = self.cb_suffix.isChecked()
@@ -414,74 +565,53 @@ class TabInsert(QWidget):
         rules = self.collect_rules()
         if not rules: QMessageBox.information(self, "提示", "没有有效规则，无法处理。"); return
 
+        # UI 状态
         self.btn_go.setEnabled(False)
-        ok = 0; fail = 0
-        self.logln(f"=== 开始处理（单位：{unit}；Y基准：{origin_mode}） ===")
+        self.btn_open_out.setEnabled(False)
+        self.pb.setRange(0, 1); self.pb.setValue(0)
+        self.logln("🚀 任务已启动，后台处理进行中…")
 
-        for dirpath, dirs, files in os.walk(root):
-            abs_dirs = [os.path.abspath(os.path.join(dirpath, d)) for d in dirs]
-            dirs[:] = [d for d, absd in zip(dirs, abs_dirs) if not (absd == out_root_abs or absd.startswith(out_root_abs + os.sep))]
-            for f in files:
-                if not f.lower().endswith(".pdf"): continue
-                pdf = os.path.join(dirpath, f)
+        # 后台线程
+        self._thread = QThread(self)
+        self._worker = InsertWorker(root, out_root_abs, add_suffix, rules, unit, origin_mode)
+        self._worker.moveToThread(self._thread)
 
-                try:
-                    doc = fitz.open(pdf)
-                except Exception as e:
-                    fail += 1; self.logln(f"⚠️ 无法打开：{pdf} -> {e}"); continue
+        # 信号连接
+        self._thread.started.connect(self._worker.run)
+        self._worker.log.connect(self.logln)
+        self._worker.progress_max.connect(lambda m: self.pb.setRange(0, m))
+        self._worker.progress_val.connect(self.pb.setValue)
 
-                if doc.is_encrypted:
-                    try:
-                        if not doc.authenticate(""):
-                            fail += 1; self.logln(f"⚠️ 加密且无法解密，跳过：{pdf}"); doc.close(); continue
-                    except Exception:
-                        fail += 1; self.logln(f"⚠️ 加密文件，跳过：{pdf}"); doc.close(); continue
+        def _on_finished(ok: int, fail: int, outdir: str):
+            self.btn_go.setEnabled(True)
+            self.btn_open_out.setEnabled(True)
+            self.last_out_dir = outdir
+            self.logln(f"📁 输出目录：{to_posix_abs(outdir)}")
 
-                try:
-                    for rule in rules:
-                        X = as_float(rule["x"]); Y = as_float(rule["y"])
-                        W = as_float(rule["width"]); H = as_float(rule["height"])
-                        Sx = as_float(rule["scale_x"], 100.0); Sy = as_float(rule["scale_y"], 100.0)
-                        keep_aspect = bool(rule.get("keep_aspect", True))
-                        if keep_aspect:
-                            s = min(Sx, Sy) / 100.0; Wf, Hf = W * s, H * s
-                        else:
-                            Wf, Hf = W * (Sx/100.0), H * (Sy/100.0)
+        self._worker.finished.connect(_on_finished)
 
-                        x_pt = to_pt(X, unit); w_pt = to_pt(Wf, unit)
-                        y_input_pt = to_pt(Y, unit); h_pt = to_pt(Hf, unit)
+        # 生命周期
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.finished.connect(self._worker.deleteLater)
+        self._thread.finished.connect(self._thread.deleteLater)
 
-                        pno = page_index(doc, rule["page"]); page = doc[pno]
-                        page_h = page.rect.height
-                        if use_pdf_origin:
-                            x0 = x_pt; y0 = page_h - (y_input_pt + h_pt)
-                        else:
-                            x0 = x_pt; y0 = y_input_pt
+        self._thread.start()
 
-                        rect = fitz.Rect(x0, y0, x0 + w_pt, y0 + h_pt)
-                        page.insert_image(rect, filename=rule["image"], keep_proportion=False)
+    def open_out_dir(self):
+        path = (self.last_out_dir or self.le_out.text()).strip()
+        if not path or not os.path.isdir(path):
+            QMessageBox.information(self, "提示", "暂无有效的输出目录。"); return
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except Exception as e:
+            QMessageBox.warning(self, "无法打开", f"打开目录失败：{e}")
 
-                except Exception as e:
-                    fail += 1; self.logln(f"⚠️ 插入失败：{pdf} -> {e}"); doc.close(); continue
-
-                rel = os.path.relpath(pdf, root)
-                out_dir = os.path.join(out_root_abs, os.path.dirname(rel)); ensure_dir(out_dir)
-                base = os.path.basename(rel)
-                name, ext = (base[:-4], base[-4:]) if base.lower().endswith(".pdf") else (base, ".pdf")
-                if add_suffix: name += "_signed"
-                out_pdf = os.path.join(out_dir, name + ext)
-
-                try:
-                    doc.save(out_pdf); ok += 1; self.logln(f"✅ 已处理：{out_pdf}")
-                except Exception as e:
-                    fail += 1; self.logln(f"⚠️ 保存失败：{out_pdf} -> {e}")
-                finally:
-                    doc.close()
-
-        self.logln(f"=== 完成：成功 {ok}，失败 {fail} ===")
-        self.btn_go.setEnabled(True)
-
-# ========= 页签A：从 PDF 提取 =========
+# ========= 页签A：从 PDF 提取（保持 v1.2.1） =========
 class TabExtract(QWidget):
     def __init__(self):
         super().__init__()
@@ -528,15 +658,14 @@ class TabExtract(QWidget):
         fn, _ = QFileDialog.getOpenFileName(self, "选择 PDF 文件", os.getcwd(), "PDF (*.pdf)")
         if fn:
             self.le_pdf.setText(fn)
-            # 改动2：自动将导出根目录填成 “<pdf同目录>\pic”（用户可再次修改）
+            # 自动将导出根目录填成 “<pdf同目录>/pic”（用户可再次修改）
             pdf_dir = os.path.dirname(fn)
             default_out = os.path.join(pdf_dir, "pic")
-            default_out = to_posix_abs(default_out)
-            self.le_out.setText(default_out)
+            self.le_out.setText(to_posix_abs(default_out))
 
     def pick_out(self):
         d = QFileDialog.getExistingDirectory(self, "选择导出根目录", os.getcwd())
-        if d: self.le_out.setText(d)
+        if d: self.le_out.setText(to_posix_abs(d))
 
     def scan_and_export(self):
         pdf_path = self.le_pdf.text().strip()
@@ -547,7 +676,6 @@ class TabExtract(QWidget):
         origin_mode = self.cb_origin.currentText()
         use_pdf_origin = origin_mode.startswith("从下往上")
 
-        # 改动2：导出根目录默认就是 <pdf同目录>\pic，并直接在该目录下保存图片与 JSON
         out_root = self.le_out.text().strip()
         if not out_root:
             out_root = os.path.join(os.path.dirname(pdf_path), "pic")
@@ -572,7 +700,7 @@ class TabExtract(QWidget):
             self.btn_go.setEnabled(False)
             self.logln(f"=== 开始扫描 ===")
             self.logln(f"PDF：{pdf_path}")
-            self.logln(f"导出根目录：{out_root}")
+            self.logln(f"导出根目录：{to_posix_abs(out_root)}")
             self.logln(f"单位：{unit}；Y基准：{origin_mode}；页码：{', '.join(str(p+1) for p in pages)}")
 
             rules: List[Dict[str, Any]] = []
@@ -619,7 +747,7 @@ class TabExtract(QWidget):
 
                     img_count += 1
                     img_name = f"{pdf_base}_{img_count:04d}.png"
-                    img_path = os.path.join(out_root, img_name)  # 改动2：直接导出到 out_root
+                    img_path = os.path.join(out_root, img_name)
                     try:
                         pix.save(img_path)
                     except Exception as e:
@@ -661,14 +789,13 @@ class TabExtract(QWidget):
                     )
 
             cfg = dict(
-                version="1.2",
+                version=APP_VERSION,
                 unit=unit,
                 add_suffix=False,   # 提取配置默认不加后缀
                 output_dir="",      # 导出的插入配置不强制指定输出目录
                 y_origin="从下往上（PDF 标准）" if use_pdf_origin else "从上往下（屏幕/GUI）",
                 rules=rules,
             )
-            # 改动1：JSON 配置名改为 “PDF名 + _config.json”
             json_path = os.path.join(out_root, f"{pdf_base}_config.json")
             try:
                 with open(json_path, "w", encoding="utf-8") as f:
@@ -676,7 +803,7 @@ class TabExtract(QWidget):
                 self.logln(f"=== 完成：导出图片 {img_count} 个 ===")
                 self.logln(f"JSON 配置：{json_path}")
                 QMessageBox.information(self, "完成",
-                    f"已导出 {img_count} 张 PNG 到\n{out_root}\n并生成配置：\n{json_path}")
+                    f"已导出 {img_count} 张 PNG 到\n{to_posix_abs(out_root)}\n并生成配置：\n{json_path}")
             except Exception as e:
                 QMessageBox.critical(self, "错误", f"写入 JSON 失败：{e}")
         finally:
@@ -779,7 +906,7 @@ class TabUsage(QWidget):
             </tr>
             <tr>
               <td>🎨 <b>界面与交互</b></td>
-              <td>所有路径均可视化编辑；表格支持双击预览、右键替换图片。</td>
+              <td>实时日志 + 进度条显示处理进度；完成后可一键打开输出目录。</td>
             </tr>
           </table>
 
@@ -795,66 +922,20 @@ class TabUsage(QWidget):
               </ul>
             </li>
             <li><b>页码（如 1,3-5）</b>：可指定扫描页，留空表示扫描所有页。</li>
-            <li><b>导出时白底（去透明）</b>：导出的 PNG 去除 alpha 通道并加白底，便于某些图像编辑器或下游流程。</li>
-            <li><b>扫描并导出</b>：执行提取，输出：
-              <ul>
-                <li>图片：<code>pic/&lt;PDF名&gt;_0001.png</code>、<code>_0002.png</code> …</li>
-                <li>配置：<code>pic/&lt;PDF名&gt;_config.json</code>（记录每张图的 <code>x,y,width,height,scale_x,scale_y,page,unit</code> 等）。</li>
-              </ul>
-            </li>
+            <li><b>导出时白底（去透明）</b>：导出的 PNG 去除 alpha 并加白底。</li>
           </ul>
 
           <h3>② 页签「批量插入」</h3>
           <ul>
-            <li><b>处理目录 / 浏览…</b>：选择包含待处理 PDF 的根目录；选择后，<b>输出目录</b>默认自动填为 <code>&lt;处理目录&gt;/output</code>（可改）。</li>
+            <li><b>处理目录 / 浏览…</b>：选择包含待处理 PDF 的根目录；选择后如输出目录为空或未被用户修改，自动填为 <code>&lt;处理目录&gt;/output</code>。</li>
             <li><b>输出目录 / 浏览…</b>：保存处理结果的根目录；程序自动按相对路径创建子目录。</li>
             <li><b>文件名添加后缀 _signed</b>：若勾选，输出 PDF 会在文件名后附加 <code>_signed</code>。</li>
-            <li><b>单位</b>：与提取一致，用于解释/换算你的坐标与尺寸输入。</li>
-            <li><b>Y坐标基准</b>：与提取一致，<span class="ok">建议提取与插入阶段保持一致</span>。</li>
-            <li><b>导出配置… / 导入配置…</b>：保存/载入当前表格的插入规则 JSON。</li>
-            <li><b>规则表格（列）</b>：
-              <ul>
-                <li><code>图片路径</code>（只读列，双击可在系统查看器中预览；右键可替换图片）。</li>
-                <li><code>X(单位), Y(单位)</code>：插入位置的左上角/左下角（取决于 Y 基准）。</li>
-                <li><code>宽W, 高H</code>：目标尺寸（与单位一致）。</li>
-                <li><code>X缩放%, Y缩放%</code>：在给定 <code>宽W/高H</code> 的基础上再缩放；勾选「保持等比」时使用两者的较小值。</li>
-                <li><code>页(数字或last)</code>：目标页号，或填 <code>last</code> 表示最后一页。</li>
-                <li><code>保持等比</code>：对目标宽高按统一比例缩放。</li>
-              </ul>
-            </li>
-            <li><b>添加图片… / 删除所选</b>：向表格添加/删除规则行。</li>
-            <li><b>开始处理</b>：遍历 <b>处理目录</b> 下所有 PDF，按表格规则逐个插入并保存到 <b>输出目录</b>。</li>
+            <li><b>开始处理</b>：后台线程执行；进度条与日志实时刷新；完成后可一键打开输出目录。</li>
           </ul>
-
-          <h3>③ 典型工作流</h3>
-          <ol>
-            <li><b>提取</b>：在「从PDF提取→配置」选择 PDF → 点击「扫描并导出」。得到 <code>pic/*.png</code> 与 <code>_config.json</code>。</li>
-            <li><b>校对</b>：如需微调，编辑 <code>_config.json</code>（或在「批量插入」载入后修改表格）。</li>
-            <li><b>插入</b>：切换到「批量插入」，选择 <b>处理目录</b> 与 <b>输出目录</b> → 导入配置 → 开始处理。</li>
-          </ol>
-
-          <h3>④ 默认行为与细节</h3>
-          <ul>
-            <li><b>路径风格</b>：程序统一在界面中显示正斜杠（如 <code>E:/path/to/pic</code>）。</li>
-            <li><b>命名</b>：提取的图片按页内出现顺序自动编号；配置名固定为 <code>&lt;PDF名&gt;_config.json</code>。</li>
-            <li><b>颜色/透明</b>：对 CMYK 做 RGB 转换；若存在软遮罩（<code>/SMask</code>）或 <code>/Decode [1 0]</code> 反相的情况，会自动合成/纠正；可选白底输出。</li>
-            <li><b>加密 PDF</b>：若无法空密码解密，将跳过该文件。</li>
-            <li><b>避免递归</b>：插入模式遍历时会自动跳过输出目录。</li>
-          </ul>
-
-          <h3>⑤ 常见问题</h3>
-          <ul>
-            <li><span class="warn">图像位置上下颠倒？</span> → 检查「Y坐标基准」是否与提取阶段一致。</li>
-            <li><span class="warn">插入后尺寸不合适？</span> → 确认单位（cm/pt/inch）以及是否勾选了「保持等比」。</li>
-            <li><span class="warn">图标/资源找不到？</span> → 打包时使用 <code>--add-data</code>，并在代码中用 <code>resource_path()</code> 寻址。</li>
-          </ul>
-
-          <p class="note">更多问题与更新请访问：<a href="{GITHUB_URL}">{GITHUB_URL}</a></p>
         </body>
         </html>
         """
         return html
-
 
 # ========= 主窗口 =========
 class MainWindow(QMainWindow):
@@ -866,13 +947,12 @@ class MainWindow(QMainWindow):
         self.tab_insert = TabInsert()
         self.tab_extract = TabExtract()
         self.tab_usage  = TabUsage()
-        self.tab_about  = TabAbout() 
+        self.tab_about  = TabAbout()
         tabs.addTab(self.tab_extract, "从PDF提取配置")
         tabs.addTab(self.tab_insert, "批量插入")
         tabs.addTab(self.tab_usage,  "使用说明")
-        tabs.addTab(self.tab_about,  "关于")  
+        tabs.addTab(self.tab_about,  "关于")
         self.setCentralWidget(tabs)
-        
 
 def main():
     app = QApplication(sys.argv)
